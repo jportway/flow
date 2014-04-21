@@ -19,5 +19,9 @@ project/plugins/project/
 
 # Native
 *.o
-*.so
+*.so*
 *.jnilib
+*.dylib
+
+# Temporary files
+*~

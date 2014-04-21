@@ -1,133 +1,83 @@
 import sbt._
 import Keys._
 import java.io.File
-import scala.collection.mutable.HashSet
-
-case class NativeBuild(
-  name: String,
-  cCompiler: String,
-  cFlags: Seq[String],
-  linker: String,
-  linkerFlags: Seq[String],
-  binary: String)
+import java.util.jar.Manifest
 
 object NativeKeys {
-  
-  //build settings
-  val nativeBuilds = taskKey[Seq[NativeBuild]]("All native build configurations, including cross-compilation.")
-  val nativeVersion = settingKey[String]("Version of native binary")
 
-  //compile settings
-  val nativeIncludeDirectories = settingKey[Seq[File]]("Directories to include during build (gcc -I option)")
-  
-  //link settings
-  val nativeLibraries = settingKey[Seq[String]]("Default names of libraries to use during linking.")
-  val nativeLibraryDirectories = settingKey[Seq[File]]("Directories to search for libraries (gcc -L option)")
-  
-  //directories
-  val nativeSource = settingKey[File]("Lowest level directory containing all native sources.")
-  val nativeCSources = taskKey[Seq[File]]("All c source files.")
-  val nativeTargetDirectory = settingKey[File]("Directory containing all compiled and linked files.")
+    val nativeBuildDirectory = settingKey[File]("Directory containing native build scripts.")
+    val nativeTargetDirectory = settingKey[File]("Base directory to store native products.")
+    val nativeOutputDirectory = settingKey[File]("Actual directory where native products are stored.")
+    val nativePackageUnmanagedDirectory = settingKey[File]("Directory containing external products that will be copied to the native jar.")
 
-  //tasks
-  val nativeCompile = taskKey[Map[NativeBuild, Seq[File]]]("Compile all native build configurations.")
-  val nativeLink = taskKey[Map[NativeBuild, File]]("Link all native build configurations.")
-  
+    val nativeClean = taskKey[Unit]("Clean native build.")
+    val nativeBuild = taskKey[File]("Invoke native build.")
 }
 
 object NativeDefaults {
-  import NativeKeys._
+    import NativeKeys._
 
-  private def generate(generators: SettingKey[Seq[Task[Seq[File]]]]) = generators { _.join.map(_.flatten) }
+    val autoClean = Def.task {
+        val log = streams.value.log
+        val build = nativeBuildDirectory.value
 
-  private def compile(logger: Logger, compiler: String, flags: Seq[String], includeDirectories: Seq[File], src: File, out: File): File = {
-    IO.createDirectory(out.getParentFile)
-    val parts: Seq[String] =
-      Seq(compiler) ++
-      flags ++
-      includeDirectories.map("-I" + _.getAbsolutePath) ++
-      Seq("-o", out.getAbsolutePath) ++
-      Seq("-c", src.getAbsolutePath)
-
-    val cmd = parts.mkString(" ")
-    logger.info(cmd)
-    val ev = Process(cmd) ! logger
-    if (ev != 0) throw new RuntimeException(s"Compilation of ${src.getAbsoluteFile()} failed.")
-    out
-  }
-
-  private def link(logger: Logger, linker: String, flags: Seq[String], libraryDirectories: Seq[File], libraries: Seq[String], in: Seq[File], out: File): File = {
-    val parts: Seq[String] =
-      Seq(linker) ++
-      flags ++
-      Seq("-o", out.getAbsolutePath) ++
-      in.map(_.getAbsolutePath) ++
-      libraryDirectories.map("-L" + _.getAbsolutePath) ++
-      libraries.map("-l" + _)
-
-    val cmd = parts.mkString(" ")
-    logger.info(cmd)
-    val ev = Process(cmd) ! logger
-    if (ev != 0) throw new RuntimeException(s"Linking of ${out.getAbsoluteFile()} failed.")
-    out
-  }
-
-
-  def  nativeCompileImpl() = Def.task {
-    val logger = streams.value.log
-    val builds = nativeBuilds.value
-    val outDir = nativeTargetDirectory.value
-    val includeDirs = nativeIncludeDirectories.value
-    val csrcs = nativeCSources.value
-
-    val compilations = for (build <- builds) yield {
-      logger.info("Compiling configuration " + build.name)
-      val objects = for (src <- csrcs) yield {
-        compile(logger, build.cCompiler, build.cFlags, includeDirs, src, outDir / build.name / "objects" / (src.base + ".o"))
-      }
-      build -> objects
+        Process("make distclean", build) #|| Process("clean", build) ! log
     }
-     compilations.toMap
-  }
 
-  lazy val nativeLinkImpl = Def.task {
-    val logger = streams.value.log
-    val builds = nativeBuilds.value
-    val outDir = nativeTargetDirectory.value
-    val libDirs = nativeLibraryDirectories.value
-    val libs = nativeLibraries.value
-    val compilations = nativeCompile.value
-    val version = nativeVersion.value
+    val autoLib = Def.task {
+        val log = streams.value.log
+        val build = nativeBuildDirectory.value
+        val out = nativeOutputDirectory.value
 
-    val linkages = for (build <- builds) yield {
-      logger.info("Linking configuration " + build.name)
-      val objects = compilations(build)
-      val binary = link(logger, build.linker, build.linkerFlags, libDirs, libs, objects, outDir / build.name / build.binary)
-      build -> binary
+        val configure = Process(
+            "./configure " +
+            "--prefix=" + out.getAbsolutePath + " " +
+            "--libdir=" + out.getAbsolutePath + " " +
+            "--disable-versioned-lib",
+            build)
+
+        val make = Process("make", build)
+
+        val makeInstall = Process("make install", build)
+
+        val ev = configure #&& make #&& makeInstall ! log
+        if (ev != 0)
+            throw new RuntimeException(s"Building native library failed.")
+
+        (out ** ("*.la")).get.foreach(_.delete())
+
+        out
     }
-    linkages.toMap
-  }
-  
-  def localPlatform = try {
-    Process("gcc -dumpmachine").lines.headOption
-  } catch {
-    case ex: Exception => None
-  }
 
-  
-  val settings: Seq[Setting[_]] = Seq(
-    //nativeBuilds :=
+    val nativePackageMappings = Def.task {
+        val managedDir = nativeTargetDirectory.value
+        val unmanagedDir = nativePackageUnmanagedDirectory.value
 
-    nativeSource := (sourceDirectory in Compile).value / "native",
-    includeFilter in nativeCSources := "*.c",
-    nativeCSources := (nativeSource.value ** (includeFilter in nativeCSources).value).get,
-    nativeTargetDirectory := target.value / "native",
+        val managed = (nativeBuild.value ** "*").get
+        val unmanaged = (unmanagedDir ** "*").get
 
-    nativeIncludeDirectories := Seq(nativeSource.value, nativeSource.value / "include"),
-    nativeLibraries := Seq(),
-    nativeLibraryDirectories := Seq(),
+        val managedMappings: Seq[(File, String)] = for (file <- managed; if file.isFile) yield {
+            file -> ("native/" + (file relativeTo managedDir).get.getPath)
+        }
 
-    nativeCompile := nativeCompileImpl.value,
-    nativeLink := nativeLinkImpl.value
-  )
+        val unmanagedMappings: Seq[(File, String)] = for (file <- unmanaged; if file.isFile) yield {
+            file -> ("native/" + (file relativeTo unmanagedDir).get.getPath)
+        }
+
+        managedMappings ++ unmanagedMappings
+    }
+
+    def os = System.getProperty("os.name").toLowerCase.filter(_ != ' ')
+    def arch = System.getProperty("os.arch").toLowerCase
+
+    val settings: Seq[Setting[_]] = Seq(
+        nativeTargetDirectory := target.value / "native",
+        nativeOutputDirectory := nativeTargetDirectory.value / (os + "-" + arch),
+        nativeClean := autoClean.value,
+        nativeBuild := autoLib.value,
+        nativePackageUnmanagedDirectory := baseDirectory.value / "lib_native",
+        mappings in (Compile, packageBin) ++= nativePackageMappings.value
+    )
+
 }
+

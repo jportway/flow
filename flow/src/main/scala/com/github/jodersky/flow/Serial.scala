@@ -7,11 +7,14 @@ import akka.util.ByteString
 /** Defines messages used by flow's serial IO layer. */
 object Serial extends ExtensionKey[SerialExt] {
 
+  /** Base trait for any flow-related messages. */
+  sealed trait Message
+  
   /** A message extending this trait is to be viewed as a command, an out-bound message issued by the client to flow's API. */
-  trait Command
+  trait Command extends Message
 
   /** A message extending this trait is to be viewed as an event, an in-bound message issued by flow to the client. */
-  trait Event
+  trait Event extends Message
 
   /** A command has failed. */
   case class CommandFailed(command: Command, reason: Throwable) extends Event
@@ -26,46 +29,26 @@ object Serial extends ExtensionKey[SerialExt] {
    * In case the port is successfully opened, the operator will respond with an `Opened` message.
    * In case the port cannot be opened, the manager will respond with a `CommandFailed` message.
    *
+   * @param port name of serial port to open
    * @param settings settings of serial port to open
+   * @param bufferSize maximum read and write buffer sizes
    */
-  case class Open(settings: SerialSettings) extends Command
+  case class Open(port: String, settings: SerialSettings, bufferSize: Int = 1024) extends Command
 
   /**
    * A port has been successfully opened.
    *
    * Event sent by a port operator, indicating that a serial port was successfully opened. The sender
-   * of this message is the operator associated to the given serial port. Furthermore, an additional reference
-   * to the operator is provided in this class' `operator` field.
+   * of this message is the operator associated to the given serial port.
    *
-   * @param settings settings of port that was opened
-   * @param operator operator associated with the serial port
+   * @param port name of opened serial port
    */
-  case class Opened(settings: SerialSettings, operator: ActorRef) extends Event
-
-  /**
-   * Register an actor to receive events.
-   *
-   * Send this command to a serial operator to register an actor for notification on the reception of data on the operator's associated port.
-   * Upon reception, data will be sent by the operator to registered actors in form of `Received` events.
-   *
-   * @param receiver actor to register
-   */
-  case class Register(receiver: ActorRef) extends Command
-
-  /**
-   * Unregister an actor from receiving events.
-   *
-   * Send this command to a serial operator to unregister an actor for notification on the reception of data on the operator's associated port.
-   *
-   * @param receiver actor to unregister
-   */
-  case class Unregister(receiver: ActorRef) extends Command
+  case class Opened(port: String) extends Event
 
   /**
    * Data has been received.
    *
    * Event sent by an operator, indicating that data was received on the operator's serial port.
-   * Clients must register (see `Register`) with a serial operator to receive these events.
    *
    * @param data data received on the port
    */
@@ -78,17 +61,20 @@ object Serial extends ExtensionKey[SerialExt] {
    * An acknowledgment may be set, in which case it is sent back to the sender on a successful write.
    * Note that a successful write does not guarantee the actual transmission of data through the serial port,
    * it merely guarantees that the data has been stored in the operating system's kernel buffer, ready to
-   * be written.
+   * be transmitted.
    *
    * @param data data to be written to port
-   * @param ack acknowledgment sent back to sender once data has been enqueued in kernel for sending
+   * @param ack acknowledgment sent back to sender once data has been enqueued in kernel for sending (the acknowledgment
+   * is a function 'number of bytes written => event')
    */
-  case class Write(data: ByteString, ack: Event = NoAck) extends Command
+  case class Write(data: ByteString, ack: Int => Event = NoAck) extends Command
 
   /**
    *  Special type of acknowledgment that is not sent back.
    */
-  case object NoAck extends Event
+  case object NoAck extends Function1[Int, Event] {
+    def apply(length: Int) = sys.error("cannot apply NoAck")
+  }
 
   /**
    *  Request closing of port.

@@ -1,24 +1,21 @@
 package com.github.jodersky.flow
 
-import java.io.IOException
-
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-
-import com.github.jodersky.flow.internal.InternalSerial
-
-import Serial._
+import com.github.jodersky.flow.internal.SerialConnection
+import Serial.CommandFailed
+import Serial.Open
 import akka.actor.Actor
 import akka.actor.ActorLogging
-import akka.actor.OneForOneStrategy
-import akka.actor.Props
-import akka.actor.SupervisorStrategy.Escalate
-import akka.actor.SupervisorStrategy.Stop
 import akka.actor.actorRef2Scala
+import akka.actor.OneForOneStrategy
+import akka.actor.OneForOneStrategy
+import akka.actor.SupervisorStrategy._
+import scala.concurrent.duration._
 
 /**
- * Actor that manages serial port creation. Once opened, a serial port is handed over to
+ * Entry point to the serial API. Actor that manages serial port creation. Once opened, a serial port is handed over to
  * a dedicated operator actor that acts as an intermediate between client code and the native system serial port.
  * @see SerialOperator
  */
@@ -26,20 +23,16 @@ class SerialManager extends Actor with ActorLogging {
   import SerialManager._
   import context._
 
-  override val supervisorStrategy =
-    OneForOneStrategy() {
-      case _: IOException => Stop
-      case _: Exception => Escalate
-    }
+  override val supervisorStrategy = OneForOneStrategy() {
+    case _: Exception => Stop
+  }
 
   def receive = {
-    case c @ Open(s) => Try { InternalSerial.open(s.port, s.baud, s.characterSize, s.twoStopBits, s.parity.id) } match {
-      case Failure(t) => sender ! CommandFailed(c, t)
-      case Success(serial) => {
-        val operator = context.actorOf(SerialOperator(serial), name = escapePortString(s.port))
-        val settings = SerialSettings(serial.port, serial.baud, serial.characterSize, serial.twoStopBits, Parity(serial.parity)) 
-        sender.tell(Opened(settings, operator), operator)
-      }
+    case open @ Open(port, settings, bufferSize) => Try {
+      SerialConnection.open(port, settings)
+    } match {
+      case Success(connection) => context.actorOf(SerialOperator(connection, bufferSize, sender), name = escapePortString(connection.port))
+      case Failure(err) => sender ! CommandFailed(open, err)
     }
   }
 
